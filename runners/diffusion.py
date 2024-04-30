@@ -233,7 +233,7 @@ class Diffusion(object):
                     x[s] = xs[t[s]][s]
             elif t_mode == "diff":
                 uncertainty = torch.zeros(self.args.timesteps).to(self.device)
-                uncertainty_mark = torch.arange(0, self.args.timesteps)
+                uncertainty_mark = torch.arange(0, self.args.timesteps).to(self.device)
                 for k, layer in enumerate(model.modules()):
                     if type(layer) in [QConv2d]:
                         alpha = F.softmax(layer.alpha_activ, dim=1)
