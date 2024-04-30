@@ -21,7 +21,7 @@ The following experiments were performed in GeForce RTX 3090 with 24GB memory.
 
 ### Generate CIFAR-10 Images
 
-You can run the following command to generate 50000 cifar-10 32*32 images in low bitwidths with differentiable group-wise quantization and active timestep selection.
+You can run the following command to generate 50000 CIFAR-10 32*32 images in low bitwidths with differentiable group-wise quantization and active timestep selection.
 
 ```
 sh sample_cifar.sh
