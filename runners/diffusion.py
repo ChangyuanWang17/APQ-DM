@@ -20,7 +20,7 @@ from utils import *
 # from utils.quant_util import calibrate
 from utils.quant_util import QConv2d
 from torch import optim
-import torch.nn.functional as F
+import util
 
 def torch2hwcuint8(x, clip=False):
     if clip:
@@ -113,6 +113,7 @@ class Diffusion(object):
 
         model = model.to(self.device)
         model = torch.nn.DataParallel(model)
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[self.args.gpu], find_unused_parameters=True)
 
         optimizer = get_optimizer(self.config, model.parameters())
 
@@ -198,7 +199,6 @@ class Diffusion(object):
 
     def generate_calibrate_set(self, fpmodel, model, t_mode, num_calibrate_set):
         print("start to create calibrate set in:" + str(t_mode))
-        num_calibrate_set = 32
         with torch.no_grad():
             n = num_calibrate_set
             # n = self.args.timesteps
@@ -231,21 +231,22 @@ class Diffusion(object):
                 for s in range(n):
                     x[s] = xs[t[s]][s]
             elif t_mode == "diff":
-                uncertainty = torch.zeros(self.args.timesteps).cuda()
-                uncertainty_mark = torch.arange(0, self.args.timesteps).cuda()
+                uncertainty = torch.zeros(self.args.timesteps).to(self.device)
+                uncertainty_mark = torch.arange(0, self.args.timesteps)
                 for k, layer in enumerate(model.modules()):
                     if type(layer) in [QConv2d]:
                         alpha = F.softmax(layer.alpha_activ, dim=1)
+                        # print(alpha[0].grad)
                         _ ,group_n, dim = alpha.shape
                         for t in range(self.args.timesteps):
                             uncertainty[t] += self.cal_entropy(alpha[t]) / dim
-                uncertainty -= 2 * self.sample_count 
+                uncertainty -= self.args.sample_weight * self.sample_count 
                 uncertainty = uncertainty[30:]
                 uncertainty_mark = uncertainty_mark[30:]
                 uncertainty_max = torch.max(uncertainty)
                 uncertainty_max_list = uncertainty[uncertainty == uncertainty_max]
                 uncertainty_mark_list = uncertainty_mark[uncertainty == uncertainty_max]
-                t = uncertainty_mark_list[-1] 
+                t = uncertainty_mark_list[-1]
                 self.sample_count[t] += 1 
                 print(uncertainty, t)
                 x = xs[t]
@@ -261,7 +262,7 @@ class Diffusion(object):
             #     )
             #     img_id += 1
 
-        # print(calibrate_set.shape)  # torch.Size([64, 3, 32, 32])
+        # print(calibrate_set.shape)  # torch.Size([batchsize, 3, 32, 32])
         return calibrate_set
 
 
@@ -277,7 +278,7 @@ class Diffusion(object):
                 ** 2
             )
             self.seq = [int(s) for s in list(seq)]
-        # quantized model
+
         model = Model(self.config, quantization=True, sequence=self.seq, args=self.args)
 
         if not self.args.use_pretrained:
@@ -313,6 +314,7 @@ class Diffusion(object):
 
             model = model.to(self.device)
             model = torch.nn.DataParallel(model)
+            # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[self.args.gpu], find_unused_parameters=True)
             if self.config.data.dataset == "CELEBA":
                 states = states[-1] # ema
             state_dict = model.state_dict()
@@ -363,18 +365,16 @@ class Diffusion(object):
             model.load_state_dict(torch.load(ckpt, map_location=self.device))
             model.to(self.device)
             model = torch.nn.DataParallel(model)
+            # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[self.args.gpu], find_unused_parameters=True)
 
         model.eval()
-
-        # for name, module in model.named_modules():
-        #     print(name, module)
-        # return 
-        # conduct fp model
+        
+        # FP model for calibration generation
         fpmodel = Model(self.config, quantization=False)
         # for name, module in fpmodel.named_modules():
         #     print(name, module)
-        # return 
         fpmodel = fpmodel.to(self.device)
+        # fpmodel = torch.nn.DataParallel(fpmodel, device_ids=[self.args.gpu])
         fpmodel = torch.nn.DataParallel(fpmodel)
         state_dict = fpmodel.state_dict()
         keys = []
@@ -392,24 +392,31 @@ class Diffusion(object):
         # generate calibrate set
         self.t_mode = self.args.calib_t_mode
         if self.config.data.dataset == "CELEBA":
-            batchsize = 8
-            num_calibrate_set = 1024
+            batchsize = 4
         elif self.config.data.dataset == "CIFAR10":
-            batchsize = 8
-            num_calibrate_set = 1024
+            batchsize = 16
+        num_calibrate_set = 1024
         print("batchsize:"+str(batchsize))
         print("num_calibrate_set:"+str(num_calibrate_set))
 
         diff_times = int(num_calibrate_set/batchsize)
-        self.sample_count = torch.zeros(self.args.timesteps).cuda()
+        self.sample_count = torch.zeros(self.args.timesteps).to(self.device)
         self.first_flag = True
-        for i in range(diff_times):
+        start_step = 0
+            
+        # self.first_flag = True
+        if start_step == diff_times:
+            start_step -= 1
+            self.first_flag = True
+        print(str(start_step)+"step, total"+str(diff_times))
+        for step in range(start_step, diff_times):
             time_start_1 = time.time()
             calibrate_set = self.generate_calibrate_set(fpmodel, model, self.t_mode, batchsize)
             model = self.calibrate_loss(model, calibrate_set, self.device, batchsize)
             time_end_1 = time.time()
-            print("运行时间："+str(time_end_1 - time_start_1)+"秒,第"+str(i)+",共"+str(diff_times))
+            print("running time: "+str(time_end_1 - time_start_1)+"s,"+str(start_step)+"step, total"+str(diff_times))
             self.first_flag = False
+
         print(self.sample_count)
 
         if self.args.fid:
@@ -423,8 +430,16 @@ class Diffusion(object):
 
     def sample_fid(self, model):
         config = self.config
-        img_id = len(glob.glob(f"{self.args.image_folder}/*"))
+        img_id = len(glob.glob(f"{self.args.image_folders}/*"))
         print(f"starting from image {img_id}")
+        # multi-gpu
+        # node_rank = os.environ['RANK']
+        # world_size = os.environ['WORLD_SIZE']
+        # print(node_rank, world_size)
+        # total_n_samples = 50000
+        # # n_rounds = (total_n_samples - img_id) // config.sampling.batch_size
+        # n_rounds = (total_n_samples - img_id) // (config.sampling.batch_size * int(world_size))
+        # img_id += int(node_rank)
         total_n_samples = 50000
         n_rounds = (total_n_samples - img_id) // config.sampling.batch_size
 
@@ -446,28 +461,11 @@ class Diffusion(object):
 
                 for i in range(n):
                     tvu.save_image(
-                        x[i], os.path.join(self.args.image_folder, f"{img_id}.png")
+                        x[i], os.path.join(self.args.image_folders, f"{img_id}.png")
                     )
                     img_id += 1
-
-            last_numsample = total_n_samples - img_id
-            n = last_numsample
-            x = torch.randn(
-                n,
-                config.data.channels,
-                config.data.image_size,
-                config.data.image_size,
-                device=self.device,
-            )
-
-            x = self.sample_image(x, model)
-            x = inverse_data_transform(config, x)
-
-            for i in range(n):
-                tvu.save_image(
-                    x[i], os.path.join(self.args.image_folder, f"{img_id}.png")
-                )
-                img_id += 1
+                    # multi-gpu
+                    # img_id += int(world_size)
 
     def sample_sequence(self, model):
         config = self.config
@@ -489,7 +487,7 @@ class Diffusion(object):
         for i in range(len(x)):
             for j in range(x[i].size(0)):
                 tvu.save_image(
-                    x[i][j], os.path.join(self.args.image_folder, f"{j}_{i}.png")
+                    x[i][j], os.path.join(self.args.image_folders, f"{j}_{i}.png")
                 )
 
     def sample_interpolation(self, model):
@@ -530,7 +528,7 @@ class Diffusion(object):
                 xs.append(self.sample_image(x[i : i + 8], model))
         x = inverse_data_transform(config, torch.cat(xs, dim=0))
         for i in range(x.size(0)):
-            tvu.save_image(x[i], os.path.join(self.args.image_folder, f"{i}.png"))
+            tvu.save_image(x[i], os.path.join(self.args.image_folders, f"{i}.png"))
 
     def sample_image(self, x, model, last=True):
         try:
@@ -588,7 +586,7 @@ class Diffusion(object):
             if isinstance(module, QConv2d):
                 module.set_calibrate(calibrate=True)
         image = image.to(device)
-        # print(image.shape)
+        print(image.shape)
         with torch.no_grad():
             self.sample_image(image, model)
         for name, module in model.named_modules():
@@ -605,7 +603,7 @@ class Diffusion(object):
                 module.set_calibrate(calibrate=True)
                 module.first_calibrate(calibrate=self.first_flag)
         image = image.to(device)
-        
+
         activation_range_params = []
         for name, param in model.named_parameters():
             if "alpha_activ" in name:
@@ -615,16 +613,10 @@ class Diffusion(object):
         optimizer = torch.optim.AdamW(activation_range_params, 0.05,
                                weight_decay=0.05)
     
-        from functions.denoising import generalized_steps_loss, generalized_steps
-        # print(int(image.shape[0]/batchsize))
-        for epoch in range(1):
-            for i in range(int(image.shape[0]/batchsize)):
-                if self.t_mode == "diff":
-                    xs = generalized_steps_loss(image[i*batchsize: (i+1)*batchsize], self.seq, model, self.betas, optimizer, eta=self.args.eta
-                                                , t_mode=self.t_mode, timestep_select=self.timestep_select)
-                else:
-                    xs = generalized_steps(image[i*batchsize: (i+1)*batchsize], self.seq, model, self.betas, optimizer, eta=self.args.eta
-                                                , t_mode=self.t_mode)
+        from functions.denoising import generalized_steps_loss
+        xs = generalized_steps_loss(image, self.seq, model, self.betas, optimizer, eta=self.args.eta
+                                                , t_mode=self.t_mode, timestep_select=self.timestep_select,
+                                   args=self.args)
         for name, module in model.named_modules():
             if isinstance(module, QConv2d):
                 module.set_calibrate(calibrate=False)
