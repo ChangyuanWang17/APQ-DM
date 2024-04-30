@@ -45,10 +45,10 @@ def lp_loss(pred, tgt, p=2.0, reduction='none'):
 
 
 class Quant(nn.Module):
-    def __init__(self, range_left=-6, range_right=6, dim=128):
+    def __init__(self, range_left=-6, range_right=6, dim=128, device=None):
         super(Quant, self).__init__()
-        self.range_left = torch.tensor([range_left], requires_grad=True).cuda()
-        self.range_right = torch.tensor([range_right], requires_grad=True).cuda()
+        self.range_left = torch.tensor([range_left], requires_grad=True).to(device)
+        self.range_right = torch.tensor([range_right], requires_grad=True).to(device)
         self.act_function = AsymmetricQuantFunction.apply
 
     def forward(self, inputs, a_bit):
@@ -56,6 +56,7 @@ class Quant(nn.Module):
         scale, zero_point = asymmetric_linear_quantization_params(
                 a_bit, self.range_left, self.range_right
         )
+        # print(scale.requires_grad, zero_point.requires_grad)
         new_quant_x = torch.round(scale * inputs.transpose(1,-1) - zero_point)
         n = 2**(a_bit - 1)
         new_quant_x_1 = 0.5 * ((-new_quant_x - n).abs() - (new_quant_x - (n - 1)).abs() - 1)
@@ -69,14 +70,20 @@ seq = 0
 class QModule(nn.Module):
     def __init__(self, in_channels=128, out_channels=128, w_bit=8, a_bit=8, half_wave=False, sequence=None, args=None):
         super(QModule, self).__init__()
+        device = (
+                torch.device("cuda")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        self.device = device
 
         self._a_bit = a_bit
         self._w_bit = w_bit
         self._b_bit = 32
         
         self._half_wave = half_wave
-        # self.sequence = list(reversed(sequence))
-        self.len_seq = 100
+        self.sequence = list(reversed(sequence))
+        self.len_seq = len(self.sequence)
         self.index_seq = 0
         self.args = args
         # print(self.sequence)
@@ -88,7 +95,9 @@ class QModule(nn.Module):
         # self.activation_range_max = nn.Parameter(torch.Tensor(torch.zeros(self.len_seq, in_channels)))
         self.activation_range_min = torch.Tensor(torch.zeros(self.len_seq, in_channels))
         self.activation_range_max = torch.Tensor(torch.zeros(self.len_seq, in_channels))
-        self.groups_range = torch.Tensor(torch.zeros([self.len_seq, self.group_num, 2])).cuda()
+        self.groups_range = nn.Parameter(torch.zeros([self.len_seq, self.group_num, 2]), requires_grad=False)
+        # self.groups_range = torch.Tensor(torch.zeros([self.len_seq, self.group_num, 2])).to(self.device)
+        # self.weight_range = nn.Parameter(torch.Tensor([-1.0]), requires_grad=False)
 
         self._quantized = True
         self._tanh_weight = False
@@ -102,14 +111,14 @@ class QModule(nn.Module):
         self.weight_function = AsymmetricQuantFunction.apply
         self.act_function = AsymmetricQuantFunction.apply
 
-        self.activation_range_min1 = torch.Tensor(torch.zeros(self.len_seq, self.in_channels)).cuda()
-        self.activation_range_max1 = torch.Tensor(torch.zeros(self.len_seq, self.in_channels)).cuda()
-        self.weight_range_min = torch.Tensor(torch.zeros(self.out_channels)).cuda()
-        self.weight_range_max = torch.Tensor(torch.zeros(self.out_channels)).cuda()
+        self.activation_range_min1 = torch.Tensor(torch.zeros(self.len_seq, self.in_channels)).to(self.device)
+        self.activation_range_max1 = torch.Tensor(torch.zeros(self.len_seq, self.in_channels)).to(self.device)
+        self.weight_range_min = torch.Tensor(torch.zeros(self.out_channels)).to(self.device)
+        self.weight_range_max = torch.Tensor(torch.zeros(self.out_channels)).to(self.device)
 
         self.alpha_activ = nn.Parameter(torch.Tensor(self.len_seq, self.group_num, in_channels), requires_grad=True)
         self.alpha_activ.data.fill_(0.01)
-        self.sw = torch.Tensor(self.group_num, in_channels).cuda()
+        self.sw = torch.Tensor(self.group_num, in_channels).to(self.device)
         self.mix_activ_mark1 = nn.ModuleList()
 
     @property
@@ -182,25 +191,28 @@ class QModule(nn.Module):
         self.activation_range_max1[self.index_seq] = torch.max(inputs_calibrate, 1)[0]
 
         self.activation_range_min1[self.index_seq] = torch.where(self.activation_range_min1[self.index_seq] > init_min
-                                                    , init_min*torch.ones(self.in_channels).cuda(), self.activation_range_min1[self.index_seq])
+                                                    , init_min*torch.ones(self.in_channels).to(self.device), self.activation_range_min1[self.index_seq])
         self.activation_range_max1[self.index_seq] = torch.where(self.activation_range_max1[self.index_seq] < init_max
-                                                    , init_max*torch.ones(self.in_channels).cuda(), self.activation_range_max1[self.index_seq])
+                                                    , init_max*torch.ones(self.in_channels).to(self.device), self.activation_range_max1[self.index_seq])
 
         self.activation_range_min1[self.index_seq], group_range_min = GroupWise_Quantizaion(self.activation_range_min1[self.index_seq].detach().clone(), 
                                                                         dim=self.in_channels, group_n=self.group_num, maxmin='min')
         self.activation_range_max1[self.index_seq], group_range_max = GroupWise_Quantizaion(self.activation_range_max1[self.index_seq].detach().clone(), 
                                                                         dim=self.in_channels, group_n=self.group_num, maxmin='max')
-
+  
         self.activation_range_min = torch.tensor(self.activation_range_min1, device=inputs.device)
         self.activation_range_max = torch.tensor(self.activation_range_max1, device=inputs.device)
-
         self.groups_range[self.index_seq] = torch.stack([group_range_min, group_range_max], dim=1)
         
         # differentiable search
         self.mix_activ_mark1 = nn.ModuleList()
         for group in torch.stack([group_range_min, group_range_max], dim=1):
-            self.mix_activ_mark1.append(Quant(range_left=group[0], range_right=group[1], dim=self.in_channels))
+            self.mix_activ_mark1.append(Quant(range_left=group[0], range_right=group[1], dim=self.in_channels, device=self.device))
         self.sw = F.softmax(self.alpha_activ[self.index_seq], dim=0)
+        # print(self.sw.grad, self.alpha_activ[self.index_seq].grad)
+        # print(self.sw.requires_grad, self.alpha_activ.requires_grad)
+        # print(self.groups_range[self.index_seq][1], self.sw[1][0])
+        # print(self.alpha_activ)
         inputs_1 = inputs.transpose(1, -1)
         for i, branch in enumerate(self.mix_activ_mark1):
             x = branch(inputs_1, a_bit=self._a_bit)
@@ -213,16 +225,18 @@ class QModule(nn.Module):
 
     def _quantize_activation(self, inputs):
         # print(self._a_bit, self._w_bit)
-        if self.index_seq >= 100:
+        if self.index_seq >= self.args.timesteps:
             self.index_seq = 0
         global seq
         seq += 1
-        if seq >= (44+1):  # 一个Qconv，一次前传22个conv
+        if seq >= (44+1):  # one Qconv have 22 conv in a forward
             seq = 1
 
         if self._calibrate:
             # first search
             if self._first_calibrate:
+                # L_p norm minimization as described in LAPQ
+                # https://arxiv.org/abs/1911.07190
                 best_score = 1e+10
                 best_max = self.init_range_max[self.index_seq]
                 best_min = self.init_range_min[self.index_seq]
@@ -239,6 +253,7 @@ class QModule(nn.Module):
                     self.init_range_max[self.index_seq] = best_max
                     self.init_range_min[self.index_seq] = best_min
             activ = self.calibrate_quantization(inputs, self.init_range_min[self.index_seq], self.init_range_max[self.index_seq])
+
             self.index_seq += 1
             return activ
 
@@ -248,17 +263,18 @@ class QModule(nn.Module):
         for i in range(self.group_num):
             group_left_tmp = self.groups_range[self.index_seq][i][0]
             group_right_tmp = self.groups_range[self.index_seq][i][1]
-            activation_range_diff_min += group_left_tmp * self.sw[i]
-            activation_range_diff_max += group_right_tmp * self.sw[i]
+            activation_range_diff_min = activation_range_diff_min + group_left_tmp * self.sw[i]
+            activation_range_diff_max = activation_range_diff_max + group_right_tmp * self.sw[i]
 
-        # quantization
         scale, zero_point = asymmetric_linear_quantization_params(
                 self._a_bit, activation_range_diff_min, activation_range_diff_max
         )
+
         new_quant_x = torch.round(scale * inputs.transpose(1,-1) - zero_point)
         n = 2**(self._a_bit - 1)
+        # new_quant_x = torch.clamp(new_quant_x, -n, n - 1)
+        # ori_x = 0.5 * ((-inputs - self.activation_range).abs() - (inputs - self.activation_range).abs())
         new_quant_x_1 = 0.5 * ((-new_quant_x - n).abs() - (new_quant_x - (n - 1)).abs() - 1)
-
         quant_act = (new_quant_x_1 + zero_point) / scale
         quant_act = quant_act.transpose(1,-1)
 
@@ -272,10 +288,10 @@ class QModule(nn.Module):
             w_max = x_transform.max(dim=1).values
             tmp_min = torch.stack((self.weight_range_min, w_min), dim=0)
             tmp_max = torch.stack((self.weight_range_max, w_max), dim=0)
-
             self.weight_range_min += -self.weight_range_min + torch.min(tmp_min, 0)[0]
             self.weight_range_max += -self.weight_range_max + torch.max(tmp_max, 0)[0]
             return weight
+
         scaling_factor = self.weight_range_max / (pow(2., self._w_bit - 1) - 1.)
         w = 0.5 * ((-weight.transpose(0,-1) + self.weight_range_min).abs() - (weight.transpose(0,-1) - self.weight_range_max).abs() + self.weight_range_min + self.weight_range_max)
         w.div_(scaling_factor).round_().mul_(scaling_factor)
@@ -380,7 +396,6 @@ class QConv2d(QModule):
             s += ', half wave' if self.half_wave else ', full wave'
         return s.format(**self.__dict__)
 
-
 def GroupWise_Quantizaion(x, dim=128, group_n=8, maxmin='max'):
     C = dim
     range_max = x.max()
@@ -392,9 +407,9 @@ def GroupWise_Quantizaion(x, dim=128, group_n=8, maxmin='max'):
         range_group.append(range_min + range_div * (m+1)/group_n)
     # print(range_group)
     # 分组标识矩阵
-    mark = torch.zeros(C).cuda()
+    mark = torch.zeros(C).to(x.device)
     for m in range(group_n):
-        mark = torch.where(((x>=range_group[m])&(x<=range_group[m+1])), (m+1)*torch.ones(C).cuda(), mark)
+        mark = torch.where(((x>=range_group[m])&(x<=range_group[m+1])), (m+1)*torch.ones(C).to(x.device), mark)
     # print(mark)
     # 分组量化阈值
     group_mean = []
@@ -411,9 +426,9 @@ def GroupWise_Quantizaion(x, dim=128, group_n=8, maxmin='max'):
     # print(group_mean)
     group_mean = torch.tensor(group_mean, requires_grad=True, device=x.device)
     # 输出分组量化结果矩阵
-    x_q = torch.zeros(C).cuda()
+    x_q = torch.zeros(C).to(x.device)
     for m in range(group_n):
-        x_q += torch.where(mark == (m+1), group_mean[m], torch.zeros(C).cuda())
+        x_q = x_q + torch.where(mark == (m+1), group_mean[m], torch.zeros(C).to(x.device))
     # print(x_q)
     return x_q, group_mean
 
