@@ -1,7 +1,6 @@
 # APQ-DM
 
-​	This is the official pytorch implementation for the paper: [Towards Accurate Post-training Quantization for Diffusion Models](https://arxiv.org/abs/2307.01848). (CVPR24 Poster Highlight)
-
+​	This is the official pytorch implementation for the paper: [Towards Accurate Post-training Quantization for Diffusion Models](https://arxiv.org/abs/2305.18723). (CVPR24 Poster Highlight)
 
 ## Quick Start
 
