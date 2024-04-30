@@ -24,7 +24,7 @@ def generalized_steps(x, seq, model, b, **kwargs):
             next_t = (torch.ones(n) * j).to(x.device)
             at = compute_alpha(b, t.long())
             at_next = compute_alpha(b, next_t.long())
-            xt = xs[-1].to('cuda')
+            xt = xs[-1].to(x.device)
             # print(t, t.shape)  #800, 64
             # print(xt.device, t.device)
             et = model(xt, t)
@@ -60,12 +60,7 @@ def noise_estimation_loss(model,
     
 def generalized_steps_loss(x, seq, model, b, optimizer, t_mode, **kwargs):
     model.eval()
-    # model.train()
-    # if t_mode == "diff":
-    #     seq = torch.tensor([kwargs["timestep_select"]])
-    #     seq_next = torch.tensor([0])
-    # else:
-    #     seq_next = [-1] + list(seq[:-1])
+    args = kwargs["args"]
     n = x.size(0)
     seq_next = [-1] + list(seq[:-1])
     x0_preds = []
@@ -74,45 +69,21 @@ def generalized_steps_loss(x, seq, model, b, optimizer, t_mode, **kwargs):
     # print(len(seq)) # 100
     for i, j in zip(reversed(seq), reversed(seq_next)):
         t = (torch.ones(n) * i).to(x.device)
-        # print(t.requires_grad)  # False
         next_t = (torch.ones(n) * j).to(x.device)
         at = compute_alpha(b, t.long())
         at_next = compute_alpha(b, next_t.long())
         xt = xs[-1].to('cuda').detach()
-        # xt = xs[0].to('cuda').detach()
-        # xt.requires_grad = False
-        # print(xt.requires_grad)
-        # print(t, t.shape)  #800, 64
-        # print(xt.device, t.device)
-        # et = model(xt, t)
         e = torch.randn_like(xt)
-        # print(xt[0][1][0][1])
-        # total_loss, et = noise_estimation_loss(model, xt, t, e, b)
-        for ii, jj in zip(reversed(seq), reversed(seq_next)):
-            t = (torch.ones(n) * ii).to(x.device)
-            total_loss, et = noise_estimation_loss(model, xt, t, e, b)
-            # print(total_loss)
-        # et = model(xt, t.float())
+        total_loss, et = noise_estimation_loss(model, xt, t, e, b)
+
         dm_loss_t = 0
         for k, layer in enumerate(model.modules()):
-            # print(type(layer))
             if type(layer) in [QConv2d]:
-                # print(type(layer))
-                # alpha = layer.sw
-                # alpha = layer.alpha_activ[count_1]
                 alpha = F.softmax(layer.alpha_activ, dim=1)
-                # print(alpha[0].grad)
                 _ ,group_n, dim = alpha.shape
-                # dm_loss_t = 0
-                # for k in range(group_n):
-                #     dm_loss_t += cal_entropy(alpha[k])
                 dm_loss_t += cal_entropy(alpha[count_1]) / (group_n * dim)
-        # print(total_loss)
-        total_loss = total_loss + 1.0 * dm_loss_t
-        # print(alpha)
-        # total_loss = dm_loss_t
-        # print(total_loss.requires_grad)
-        # print(et.device)
+        total_loss = total_loss + args.diff_loss_weight * dm_loss_t
+
         x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
         x0_preds.append(x0_t.to('cpu'))
         c1 = (
@@ -122,7 +93,7 @@ def generalized_steps_loss(x, seq, model, b, optimizer, t_mode, **kwargs):
         xt_next = at_next.sqrt() * x0_t + c1 * torch.randn_like(x) + c2 * et
         xs.append(xt_next.to('cpu'))
 
-        # print(f"loss: {total_loss}, {dm_loss_t}, {count_1}")
+        # print(f"loss: {total_loss}, {dm_loss_t}")
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
