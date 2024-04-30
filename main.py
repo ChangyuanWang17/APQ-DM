@@ -13,7 +13,7 @@ from runners.diffusion import Diffusion
 
 torch.set_printoptions(sci_mode=False)
 
-
+    
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description=globals()["__doc__"])
 
@@ -92,8 +92,20 @@ def parse_args_and_config():
         choices=["real", "range", "diff", "random"],
     )
     parser.add_argument("--sequence", action="store_true")
-    parser.add_argument("--bitwidth", type=int, default=8)
-
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--bitwidth', type=int, default=8, help='bitwidth')
+    parser.add_argument("--normgroup", type=bool, default=False)
+    parser.add_argument(
+        "--diff_loss_weight",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--sample_weight",
+        type=float,
+        default=2.0,
+        help="eta used to control the variances of sigma",
+    )
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, "logs", args.doc)
@@ -199,7 +211,7 @@ def parse_args_and_config():
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-
+        
     torch.backends.cudnn.benchmark = True
 
     return args, new_config
