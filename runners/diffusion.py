@@ -20,6 +20,7 @@ from utils import *
 # from utils.quant_util import calibrate
 from utils.quant_util import QConv2d
 from torch import optim
+import torch.nn.functional as F
 import util
 
 def torch2hwcuint8(x, clip=False):
