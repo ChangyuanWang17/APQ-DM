@@ -431,7 +431,7 @@ class Diffusion(object):
 
     def sample_fid(self, model):
         config = self.config
-        img_id = len(glob.glob(f"{self.args.image_folders}/*"))
+        img_id = len(glob.glob(f"{self.args.image_folder}/*"))
         print(f"starting from image {img_id}")
         # multi-gpu
         # node_rank = os.environ['RANK']
@@ -462,7 +462,7 @@ class Diffusion(object):
 
                 for i in range(n):
                     tvu.save_image(
-                        x[i], os.path.join(self.args.image_folders, f"{img_id}.png")
+                        x[i], os.path.join(self.args.image_folder, f"{img_id}.png")
                     )
                     img_id += 1
                     # multi-gpu
@@ -488,7 +488,7 @@ class Diffusion(object):
         for i in range(len(x)):
             for j in range(x[i].size(0)):
                 tvu.save_image(
-                    x[i][j], os.path.join(self.args.image_folders, f"{j}_{i}.png")
+                    x[i][j], os.path.join(self.args.image_folder, f"{j}_{i}.png")
                 )
 
     def sample_interpolation(self, model):
@@ -529,7 +529,7 @@ class Diffusion(object):
                 xs.append(self.sample_image(x[i : i + 8], model))
         x = inverse_data_transform(config, torch.cat(xs, dim=0))
         for i in range(x.size(0)):
-            tvu.save_image(x[i], os.path.join(self.args.image_folders, f"{i}.png"))
+            tvu.save_image(x[i], os.path.join(self.args.image_folder, f"{i}.png"))
 
     def sample_image(self, x, model, last=True):
         try:
